@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  iaai-worker:
+    image: oleksandrnepiyko/usa-image-downloader:latest
+    container_name: iaai-image-downloader
+    restart: always
+    env_file:
+      - .env.iaai
+    # Якщо потрібно прокидати папку з логами назовні:
+    # volumes:
+    #   - ./logs/iaai:/app/iaai_images_downloader_logs
+
+
+  copart-worker:
+    image: oleksandrnepiyko/usa-image-downloader:latest
+    container_name: copart-image-downloader
+    restart: always
+    env_file:
+      - .env.copart
+
+  manheim-worker:
+    image: oleksandrnepiyko/usa-image-downloader:latest
+    container_name: manheim-image-downloader
+    restart: always
+    env_file:
+      - .env.manheim
+
+  # Автоматичне оновлення (Watchtower)
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Перевіряти оновлення кожні 60 секунд.
+    # Він автоматично знайде нові версії для oleksandrnepiyko/usa-image-downloader
+    command: --interval 60 --cleanup

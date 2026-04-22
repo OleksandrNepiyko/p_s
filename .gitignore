@@ -1,0 +1,8 @@
+.env
+*.env
+*.env.*
+*.log
+*.tmp
+*_images_downloader_logs/
+__pycache__/
+venv/

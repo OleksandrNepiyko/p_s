@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+.env
+.env.iaai
+.env.copart
+.env.manheim
+*.env.*
+*.log
+*_images_downloader_logs/
