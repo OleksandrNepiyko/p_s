@@ -3,3 +3,4 @@ aioboto3>=13.0.0
 python-dotenv>=1.0.0
 aiomysql
 aioboto3
+aiokafka

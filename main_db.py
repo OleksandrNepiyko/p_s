@@ -9,6 +9,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from botocore.config import Config
 
 import aioboto3
 import aiohttp
@@ -185,28 +186,63 @@ class MinioUploader:
             region_name=MINIO_REGION,
         )
 
+        # Золота середина: 5 одночасних завантажень
+        self._upload_sem = asyncio.Semaphore(5)
+
+        # Boto3 робить базові спроби швидко, а глибокі затримки ми зробимо самі
+        self._boto_config = Config(
+            retries={
+                'max_attempts': 3,
+                'mode': 'standard'
+            }
+        )
+
     async def upload_many(self, items: list[tuple[bytes, str]]) -> None:
         if not items:
             return
-        async with self._boto.client("s3", endpoint_url=MINIO_ENDPOINT) as s3:
-            await asyncio.gather(
+
+        async with self._boto.client("s3", endpoint_url=MINIO_ENDPOINT, config=self._boto_config) as s3:
+            # Повертаємо швидкий паралельний запуск
+            results = await asyncio.gather(
                 *[self._put(s3, data, key) for data, key in items],
                 return_exceptions=True,
             )
 
-    @staticmethod
-    async def _put(s3: Any, data: bytes, key: str) -> None:
+            # Якщо після всіх наших розумних пауз файл так і не завантажився — кидаємо помилку
+            for res in results:
+                if isinstance(res, Exception):
+                    raise res
+
+    async def _put(self, s3: Any, data: bytes, key: str) -> None:
         content_type = "video/mp4" if key.endswith(".mp4") else "image/jpeg"
-        try:
-            await s3.put_object(
-                Bucket=BUCKET,
-                Key=key,
-                Body=BytesIO(data),
-                ContentType=content_type,
-            )
-            logger.debug("Uploaded %s (%d B)", key, len(data))
-        except Exception as exc:
-            logger.error("Upload failed %s — %r", key, exc)
+
+        max_retries = 5
+        base_delay = 2.0 # Початкова пауза 2 секунди
+
+        async with self._upload_sem:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    await s3.put_object(
+                        Bucket=BUCKET,
+                        Key=key,
+                        Body=BytesIO(data),
+                        ContentType=content_type,
+                    )
+                    logger.debug("Uploaded %s (%d B)", key, len(data))
+                    return  # Успіх! Виходимо з циклу
+
+                except Exception as exc:
+                    if attempt == max_retries:
+                        logger.error("Upload failed permanently for %s — %r", key, exc)
+                        raise  # Всі спроби вичерпано, кидаємо помилку вище
+
+                    # Динамічна затримка: 2с -> 4с -> 8с -> 16с
+                    sleep_time = base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "MinIO throttled (%s). Attempt %d/%d failed. Waiting %.1fs...",
+                        key.split('/')[-1], attempt, max_retries, sleep_time
+                    )
+                    await asyncio.sleep(sleep_time)  # Кидаємо помилку вгору, щоб лот пішов на ретрай
 
 
 async def _extract_images_iaai(lot: dict[str, Any], downloader: ImageDownloader) -> list[tuple[str, bool, bool, int | None]]:
@@ -381,43 +417,55 @@ async def run() -> None:
                         await asyncio.sleep(EMPTY_POLL_SLEEP)
                         continue
 
-                    logger.info("Fetched %d record(s). Processing...", len(db_records))
-                    t0 = asyncio.get_event_loop().time()
-
                     for record in db_records:
                         current_id = record["id"]
                         raw_data = record["raw_data"]
-
                         lots = extract_lots(raw_data)
-                        if lots:
-                            for lot in lots:
-                                await process_lot(lot, downloader, uploader)
 
-                        # Оновлюємо offset локально після кожного запису (або можна після батчу)
-                        last_processed_id = current_id
+                        if not lots:
+                            # Якщо лот битий і його неможливо розпарсити — пропускаємо,
+                            # щоб не застрягти на ньому вічно
+                            last_processed_id = current_id
+                            save_offset(last_processed_id)
+                            continue
 
-                    # Зберігаємо offset у файл після успішного батчу
-                    save_offset(last_processed_id)
+                        # --- ЦИКЛ РЕТРАЮ ДЛЯ КОНКРЕТНОГО ЛОТА ---
+                        success = False
+                        retry_delay = 5 # Початкова затримка
 
-                    logger.info("Batch done in %.2fs. New offset: %s", asyncio.get_event_loop().time() - t0, last_processed_id)
+                        while not success:
+                            try:
+                                # Обробляємо лот
+                                for lot in lots:
+                                    await process_lot(lot, downloader, uploader)
+
+                                # Якщо ми дійшли сюди — все успішно
+                                success = True
+                                last_processed_id = current_id
+                                save_offset(last_processed_id) # Зберігаємо тільки після успіху
+
+                            except Exception as exc:
+                                logger.error(
+                                    "Error processing lot %s: %r. Retrying in %ds...",
+                                    current_id, exc, retry_delay
+                                )
+                                await asyncio.sleep(retry_delay)
+                                # Можна додати експоненціальне зростання затримки (опціонально)
+                                # retry_delay = min(retry_delay * 2, 60)
+
+                    logger.info("Batch completed successfully. Current offset: %s", last_processed_id)
 
                 except aiomysql.Error as exc:
-                    logger.error("Database connection lost: %r. Reconnecting in 5s...", exc)
+                    logger.error("Database error: %r. Reconnecting in 5s...", exc)
                     await asyncio.sleep(5)
                     await db_reader.close()
                     await db_reader.connect()
                 except Exception as exc:
-                    logger.error("Unexpected error in main loop: %r", exc)
+                    logger.error("Global loop error: %r", exc)
                     await asyncio.sleep(2)
 
-        except asyncio.CancelledError:
-            logger.info("Cancelled.")
-        except KeyboardInterrupt:
-            logger.info("Interrupted.")
         finally:
-            save_offset(last_processed_id) # Зберігаємо стан перед виходом
             await db_reader.close()
-            logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
     asyncio.run(run())

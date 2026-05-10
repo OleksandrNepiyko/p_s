@@ -1,0 +1,5 @@
+PS D:\Automoto\Programs\IAAI\iaai_photos_downloader>
+docker rm -f usa-image-downloader
+docker build -t oleksandrnepiyko/usa-image-downloader:latest .
+docker run -d --name usa-image-downloader --restart always --env-file .env.name_of_web oleksandrnepiyko/usa-image-downloader:latest
+docker logs -f usa-image-downloader
